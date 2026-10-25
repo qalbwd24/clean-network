@@ -1,0 +1,11 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const output=process.argv[2]?path.resolve(process.argv[2]):path.join(root,'CleanNetwork.exe');
+fs.mkdirSync(path.dirname(output),{recursive:true});
+const framework=path.join(process.env.WINDIR||'C:/Windows','Microsoft.NET/Framework64/v4.0.30319');
+const refs=['System.dll','System.Core.dll','System.Net.Http.dll','System.Web.Extensions.dll','System.Windows.Forms.dll','System.Drawing.dll','System.Xaml.dll','WPF/WindowsBase.dll','WPF/PresentationCore.dll','WPF/PresentationFramework.dll'];
+const args=['/nologo','/target:winexe','/platform:anycpu','/optimize+','/codepage:65001','/langversion:5',`/out:"${output}"`,`/win32manifest:"${path.join(root,'src/app.manifest')}"`,`/win32icon:"${path.join(root,'assets/app.ico')}"`,...refs.map(r=>`/reference:"${path.join(framework,r)}"`),...fs.readdirSync(path.join(root,'src')).filter(n=>n.endsWith('.cs')).map(n=>`"${path.join(root,'src',n)}"`)];
+fs.mkdirSync(path.join(root,'tmp'),{recursive:true});fs.writeFileSync(path.join(root,'tmp/build.rsp'),'\ufeff'+args.join('\r\n'),'utf8');
+console.log(path.join(root,'tmp/build.rsp'));
