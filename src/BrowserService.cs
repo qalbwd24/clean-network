@@ -54,7 +54,8 @@ namespace CleanBrowser {
         readonly ConcurrentDictionary<string,Task> prepared=new ConcurrentDictionary<string,Task>();
         readonly ConcurrentDictionary<string,bool> marked=new ConcurrentDictionary<string,bool>();
         readonly ConcurrentDictionary<string,string> cleanRequests=new ConcurrentDictionary<string,string>();
-        readonly object cleanGate=new object();Dictionary<string,object> cleanLatest;
+        readonly ConcurrentDictionary<string,bool> cleanSelfRequests=new ConcurrentDictionary<string,bool>();
+        readonly object cleanGate=new object();Dictionary<string,object> cleanLatest;string cleanSession;bool cleanIsSelf;
         public event Action<IpQualitySnapshot> CleanIpObserved;
         readonly Dictionary<string,string> siteTargets=new Dictionary<string,string>();
         public string Timezone {get{return timezone;}}
@@ -68,7 +69,7 @@ namespace CleanBrowser {
         }
         public async Task Ensure(CancellationToken ct) {
             if(Running)return;
-            if(cdp!=null)cdp.Dispose();sessions.Clear();prepared.Clear();marked.Clear();cleanRequests.Clear();lock(cleanGate)cleanLatest=null;siteTargets.Clear();
+            if(cdp!=null)cdp.Dispose();sessions.Clear();prepared.Clear();marked.Clear();cleanRequests.Clear();cleanSelfRequests.Clear();lock(cleanGate)cleanLatest=null;siteTargets.Clear();
             Directory.CreateDirectory(paths.Profile);port=ProxyService.FreePort();
             // No shared profile, extension injection, system proxy or Windows timezone changes.
             var args="--user-data-dir=\""+paths.Profile+"\" --no-first-run --no-default-browser-check --disable-sync --disable-quic --disable-background-networking --disable-session-crashed-bubble --hide-crash-restore-bubble --proxy-server=http://127.0.0.1:"+(endpoint==0?proxy.Port:endpoint)+" --remote-debugging-address=127.0.0.1 --remote-debugging-port="+port+" --webrtc-ip-handling-policy=disable_non_proxied_udp --force-webrtc-ip-handling-policy=disable_non_proxied_udp --lang="+settings.Locale+" --accept-lang="+settings.Locale+" about:blank";
@@ -95,9 +96,9 @@ namespace CleanBrowser {
             if(method=="Network.responseReceived"){
                 var p=Json.Obj(message["params"]);string url=Json.Str(Json.Obj(p["response"]),"url");Uri uri;
                 System.Net.IPAddress apiIP;
-                if(Uri.TryCreate(url,UriKind.Absolute,out uri)&&uri.Host=="cleanip.io"&&uri.AbsolutePath.StartsWith("/api/v2/",StringComparison.Ordinal)&&(uri.AbsolutePath=="/api/v2/me"||System.Net.IPAddress.TryParse(Uri.UnescapeDataString(uri.AbsolutePath.Substring(8)),out apiIP)))cleanRequests[Json.Str(p,"requestId")]=Json.Str(message,"sessionId");
+                if(Uri.TryCreate(url,UriKind.Absolute,out uri)&&uri.Host=="cleanip.io"&&uri.AbsolutePath.StartsWith("/api/v2/",StringComparison.Ordinal)&&(uri.AbsolutePath=="/api/v2/me"||System.Net.IPAddress.TryParse(Uri.UnescapeDataString(uri.AbsolutePath.Substring(8)),out apiIP))){string request=Json.Str(p,"requestId");cleanRequests[request]=Json.Str(message,"sessionId");cleanSelfRequests[request]=uri.AbsolutePath=="/api/v2/me";}
             }else if(method=="Network.loadingFinished"){
-                var p=Json.Obj(message["params"]);string sid;if(cleanRequests.TryRemove(Json.Str(p,"requestId"),out sid))CaptureCleanIp(Json.Str(p,"requestId"),sid);
+                var p=Json.Obj(message["params"]);string sid;bool isSelf;if(cleanRequests.TryRemove(Json.Str(p,"requestId"),out sid)){cleanSelfRequests.TryRemove(Json.Str(p,"requestId"),out isSelf);CaptureCleanIp(Json.Str(p,"requestId"),sid,isSelf);}
             }
             if(Json.Str(message,"method")=="Target.attachedToTarget") {
                 var p=Json.Obj(message["params"]);string id=Json.Str(Json.Obj(p["targetInfo"]),"targetId"),sid=Json.Str(p,"sessionId");sessions[id]=sid;
@@ -106,8 +107,12 @@ namespace CleanBrowser {
                 var p=Json.Obj(message["params"]);string id=Json.Str(p,"targetId"),unused;sessions.TryRemove(id,out unused);
             }
         }
-        async void CaptureCleanIp(string request,string sid){try{var r=await cdp.Call("Network.getResponseBody",Json.D("requestId",request),CancellationToken.None,sid,10000);string text=Json.Str(r,"body");if(Json.Bool(r,"base64Encoded"))text=Encoding.UTF8.GetString(Convert.FromBase64String(text));if(text.Length>2000000)return;var body=Json.Read(text);if(body.ContainsKey("purity")||body.ContainsKey("risk")||body.ContainsKey("error")){lock(cleanGate)cleanLatest=body;if(CleanIpObserved!=null)CleanIpObserved(CleanIpResult.Parse(body,""));}}catch{}}
-        public async Task<IpQualitySnapshot> ReadCleanIp(string expectedIP,CancellationToken ct){var clock=Stopwatch.StartNew();IpQualitySnapshot last=null;while(clock.ElapsedMilliseconds<25000){ct.ThrowIfCancellationRequested();Dictionary<string,object> data;lock(cleanGate)data=cleanLatest;if(data!=null){last=CleanIpResult.Parse(data,expectedIP);if(last.Success||last.State=="需要网站验证"||last.State=="网站限流"||last.State=="需要登录"||last.State.StartsWith("出口 IP 不一致"))return last;}await Task.Delay(300,ct);}return last??new IpQualitySnapshot {State="页面尚未返回评分，可能需要验证"};}
+        async Task<IpQualitySnapshot> WithPageChecks(IpQualitySnapshot snapshot,string sid,CancellationToken ct){
+            if(!snapshot.Success||String.IsNullOrEmpty(sid))return snapshot;
+            try{string script=File.ReadAllText(Path.Combine(paths.Install,"assets","CleanIpPage.js"),Encoding.UTF8);var result=await cdp.Call("Runtime.evaluate",Json.D("expression","JSON.stringify("+script+ ")","returnByValue",true),ct,sid,4000);var page=Json.Read(Json.Str(Json.Obj(result["result"]),"value","{}"));object checks;if(page.TryGetValue("checks",out checks)&&Json.Arr(checks).Any())CleanIpResult.ApplyChecks(snapshot,Json.Arr(checks));}catch(OperationCanceledException){ct.ThrowIfCancellationRequested();}catch{}return snapshot;
+        }
+        async void CaptureCleanIp(string request,string sid,bool isSelf){try{var r=await cdp.Call("Network.getResponseBody",Json.D("requestId",request),CancellationToken.None,sid,10000);string text=Json.Str(r,"body");if(Json.Bool(r,"base64Encoded"))text=Encoding.UTF8.GetString(Convert.FromBase64String(text));if(text.Length>2000000)return;var body=Json.Read(text);if(body.ContainsKey("purity")||body.ContainsKey("risk")||body.ContainsKey("error")){lock(cleanGate){cleanLatest=body;cleanSession=sid;cleanIsSelf=isSelf;}if(CleanIpObserved!=null){await Task.Delay(500);var snapshot=await WithPageChecks(CleanIpResult.Parse(body,""),sid,CancellationToken.None);snapshot.ObservedAsCurrentExit=isSelf;lock(cleanGate){if(!Object.ReferenceEquals(cleanLatest,body))return;}CleanIpObserved(snapshot);}}}catch{}}
+        public async Task<IpQualitySnapshot> ReadCleanIp(string expectedIP,CancellationToken ct,bool useWebsiteExit=false){var clock=Stopwatch.StartNew();IpQualitySnapshot last=null;while(clock.ElapsedMilliseconds<30000){ct.ThrowIfCancellationRequested();Dictionary<string,object> data;string sid;bool self;lock(cleanGate){data=cleanLatest;sid=cleanSession;self=cleanIsSelf;}if(data!=null){last=CleanIpResult.ParseObservation(data,expectedIP,self,useWebsiteExit);if(last.Success){for(int attempt=0;attempt<6;attempt++){await Task.Delay(500,ct);last=await WithPageChecks(last,sid,ct);if(last.ChecksTotal>0)break;}return last;}if(last.State=="需要网站验证"||last.State=="网站限流"||last.State=="需要登录"||last.State.StartsWith("出口 IP 不一致"))return last;}await Task.Delay(300,ct);}return last??new IpQualitySnapshot {State="页面尚未返回评分，可能需要验证"};}
         async Task Prepare(string sid) {
             try {await Apply(sid,CancellationToken.None);await InstallMarker(sid,CancellationToken.None,false);}catch(Exception){paths.Log("page-override","无法设置新标签页环境");}
             try{await cdp.Call("Runtime.runIfWaitingForDebugger",null,CancellationToken.None,sid);}catch{}

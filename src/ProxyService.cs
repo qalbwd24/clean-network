@@ -141,6 +141,7 @@ namespace CleanBrowser {
                 }
             }
         }
+        public async Task<double> QuickSpeed(bool upload,Action<double> progress,CancellationToken ct){using(var client=ProxyClient(16)){client.DefaultRequestHeaders.ExpectContinue=false;return upload?await SpeedMeasurements.Upload(client,"https://speed.cloudflare.com/__up",progress,ct):await SpeedMeasurements.Download(client,"https://speed.cloudflare.com/__down?bytes="+SpeedMeasurements.MaxBytes,progress,ct);}}
         public void Dispose() {if(api!=null)api.Dispose();if(process!=null){try{if(!process.HasExited){process.Kill();process.WaitForExit(2500);}}catch{}process.Dispose();}process=null;}
     }
 }

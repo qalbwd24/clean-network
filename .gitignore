@@ -18,3 +18,5 @@
 *.key
 *.db
 *.sqlite*
+# 本地构建备份与临时产物
+/backups/
